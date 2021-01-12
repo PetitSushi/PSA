@@ -8,6 +8,9 @@ library(janitor)
 library(ggplot2)
 library(stringr)
 library(spatialreg)
+library(plyr)
+library(broom)
+
 
 manchester_lsoa <-  st_read('raw/BoundaryData/england_lsoa_2011.shp')
 
@@ -30,7 +33,7 @@ listcrimedata <- fs::dir_info(here::here("raw", "greater_manchester_crime_data_2
   as.character()
 
 # upload files and create dataframe 
-data_csv = plyr::ldply(listcrimedata, read_csv)
+data_csv = plyr::ldply(listcrimedata, read.csv)
 data_csv
 
 data_csv <- clean_names(data_csv)
@@ -59,15 +62,19 @@ rm(burglary_spatial)
 #Point in polygon spatial operation (be patient this can take time)
 burglaries_per_lsoa <- bur_mc %>% 
   st_join(lsoa_WGS84, ., left = FALSE) %>% 
-  count(lsoa_code)
+  count('lsoa_code')
 
 #  rename the column with the count of burglaries (n) into something more meaningful
-burglaries_per_lsoa <- rename(burglaries_per_lsoa, burglary = n)
+burglaries_per_lsoa <- dplyr::rename(burglaries_per_lsoa, burglary = freq)
 
+colnames(burglaries_per_lsoa)
 
 # set CRS to BNG 27700 to get maps
 st_crs(burglaries_per_lsoa)
 
+
+
+burglaries_per_lsoa <- left_join(lsoa_WGS84, burglaries_per_lsoa, by = c("code" = "lsoa_code"))
 lsoa_WGS84 <- st_transform(burglaries_per_lsoa, 27700)
 
 # Plot with tmap 
@@ -75,6 +82,9 @@ lsoa_WGS84 <- st_transform(burglaries_per_lsoa, 27700)
 
 # tmap_mode("view")
 tmap_mode("plot")
+
+
+
 
 # quantile 
 # could set breaks 1, 13, 20, 28, 39 (close to jenks)
@@ -248,6 +258,10 @@ local_moran_manc_burglaries <- localmoran(burglaries_per_lsoa$burglary, Mward.lw
 # rescale that variable
 burglaries_per_lsoa$scale_n_burglaries <- scale(burglaries_per_lsoa$burglary)
 
+
+summary(burglaries_per_lsoa$burglary)
+summary(burglaries_per_lsoa$scale_n_burglaries)
+
 # create a spatial lag variable and save it to a new column
 burglaries_per_lsoa$lag_scale_n_burglaries <- lag.listw(Mward.lw, burglaries_per_lsoa$scale_n_burglaries)
 
@@ -364,14 +378,14 @@ imd_manchester <- clean_names(imd_manchester)
 # join imd to sf lsoa file
 st_crs(lsoa_WGS84)
 
-imd_manchester <- rename(imd_manchester, lsoa11cd = lsoa_code_2011)
-#burglaries_per_lsoa <- rename(burglaries_per_lsoa, lsoa11cd = lsoa_code)
+imd_manchester <- dplyr::rename(imd_manchester, lsoa11cd = lsoa_code_2011)
+burglaries_per_lsoa <- dplyr::rename(burglaries_per_lsoa, lsoa11cd = code)
 
 burglaries_imd <- dplyr::left_join(burglaries_per_lsoa,imd_manchester,by=c("lsoa11cd"))
 
-burglaries_imd <- rename(burglaries_imd, imd_dec = index_of_multiple_deprivation_imd_decile_where_1_is_most_deprived_10_of_lso_as)
-burglaries_imd <- rename(burglaries_imd, imd_score = index_of_multiple_deprivation_imd_score)
-burglaries_imd <- rename(burglaries_imd, imd_rank = index_of_multiple_deprivation_imd_rank_where_1_is_most_deprived)
+burglaries_imd <- dplyr::rename(burglaries_imd, imd_dec = index_of_multiple_deprivation_imd_decile_where_1_is_most_deprived_10_of_lso_as)
+burglaries_imd <- dplyr::rename(burglaries_imd, imd_score = index_of_multiple_deprivation_imd_score)
+burglaries_imd <- dplyr::rename(burglaries_imd, imd_rank = index_of_multiple_deprivation_imd_rank_where_1_is_most_deprived)
 
 rm(imd_manchester)
 
@@ -513,7 +527,6 @@ tm_shape(burglaries_imd) +
   tm_fill('sd_mean', style='jenks', palette='-RdBu') +
   tm_borders(alpha = 0.1) 
 
-
 st_crs(burglaries_imd)
 st_crs(burglaries_imd) = 4326
 # get output 
@@ -574,3 +587,101 @@ tidy(burglary_model2)
 
 summary(burglary_model_err2)
 tidy(burglary_model_err2)
+
+
+########### Attempt a spat lag model & GWR
+
+library(spatialreg)
+library(corrr)
+library(broom)
+library(spgwr)
+
+#select some variables from the data file
+myvars <- burglaries_imd %>%
+  dplyr::select(burglary_cube,
+                imd_score)
+
+#run a final OLS model
+model_final <- lm(burglary_cube ~ imd_score, 
+                  data = myvars)
+
+tidy(model_final)
+
+burglaries_imd <- burglaries_imd %>%
+  mutate(model_final_res = residuals(model_final))
+
+par(mfrow=c(2,2))
+plot(model_final)
+
+
+qtm(burglaries_imd, fill = "model_final_res")
+
+final_model_Moran <- burglaries_imd %>%
+  st_drop_geometry()%>%
+  dplyr::select(model_final_res)%>%
+  pull()%>%
+  moran.test(., Mward.lw)%>%
+  tidy()
+
+final_model_Moran
+
+
+
+st_crs(burglaries_imd) = 27700
+
+burglaries_imdSP <- burglaries_imd %>%
+  as(., "Spatial")
+
+st_crs(coordsW) = 27700
+
+coordsWSP <- coordsW %>%
+  as(., "Spatial")
+
+coordsWSP
+
+# calculate kernel bandwidth
+GWRbandwidth <- gwr.sel(burglary_cube ~ imd_score, 
+                        data = burglaries_imdSP, 
+                        coords=coordsWSP,
+                        adapt=T)
+
+#run the gwr model
+gwr.model = gwr(burglary_cube ~ imd_score, 
+                data = burglaries_imdSP, 
+                coords=coordsWSP, 
+                adapt=GWRbandwidth, 
+                hatmatrix=TRUE, 
+                se.fit=TRUE)
+
+
+#print the results of the model
+gwr.model
+
+results <- as.data.frame(gwr.model$SDF)
+names(results)
+
+#attach coefficients to original SF
+burglaries_imd2 <- burglaries_imd %>%
+  mutate(coefIMDscore = results$imd_score)
+
+
+# plot 
+burglaries_imd2 <- st_transform(burglaries_imd2, 4327)
+
+tm_shape(burglaries_imd2) +
+  tm_polygons(col = "coefIMDscore", 
+              palette = "RdBu", 
+              alpha = 0.5)
+
+## Doesn't work ! 
+#run the significance test
+sigTest = abs(gwr.model$SDF$imd_score.)-2 * gwr.model$SDF$imd_score._se
+
+
+#store significance results
+burglaries_imd2 <- burglaries_imd2 %>%
+  mutate(GWRIMDscoreSig = sigTest)
+
+
+tm_polygons(col = "GWRUnauthSig", 
+            palette = "RdYlBu")
